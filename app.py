@@ -5,136 +5,153 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
-import altair as alt
+from datetime import datetime
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-st.set_page_config(page_title="SFC Live Command", page_icon="🍗", layout="wide")
+# --- PAGE CONFIGURATION ---
+st.set_page_config(page_title="SFC Inventory Manager", page_icon="🍗", layout="wide")
 
-# ==========================================
-# 1. SECURE LINK LOADING
-# ==========================================
-try:
-    # This grabs the link from your private secrets file
-    SHEET_LINK = st.secrets["sheet_url"]
-except FileNotFoundError:
-    st.error("⚠️ Secrets file not found! If running locally, make sure .streamlit/secrets.toml exists.")
-    st.stop()
-except KeyError:
-    st.error("⚠️ 'sheet_url' not found in secrets file.")
-    st.stop()
-# ==========================================
-
-# --- CUSTOM CSS ---
+# --- PROFESSIONAL STYLING ---
 st.markdown("""
     <style>
-    div[data-testid="metric-container"] {
-        border: 1px solid rgba(128, 128, 128, 0.5);
-        padding: 15px;
-        border-radius: 10px;
-        background-color: rgba(255, 255, 255, 0.05);
-    }
-    div[data-testid="stMetricValue"] {
-        font-size: 28px !important;
-        font-weight: bold;
-    }
+    .main-header { font-size: 2rem; font-weight: bold; color: #b30000; }
+    .sub-header { font-size: 1.2rem; color: #333; margin-bottom: 20px; }
+    .data-row { padding: 10px; border-bottom: 1px solid #eee; }
+    .stButton button { width: 100%; background-color: #b30000; color: white; font-weight: bold; }
+    div[data-testid="stMetricValue"] { font-size: 24px; }
     </style>
     """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. DATA PARSER
+# 1. GOOGLE SHEETS CONNECTION (WRITE ACCESS)
+# ==========================================
+def get_google_sheet_client():
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        return client
+    except Exception as e:
+        # If secrets are missing or wrong, we just return None and work in Read-Only mode
+        return None
+
+# ==========================================
+# 2. DATA LOADING (THE HYBRID ENGINE)
 # ==========================================
 @st.cache_data(ttl=60)
-def load_and_parse_data(link):
-    if not link: return pd.DataFrame()
-        
+def load_all_data():
+    all_data = []
+
+    # --- PART A: LOAD HISTORY (The "Block Format" Excel Sheet) ---
     try:
-        # Convert link to export format
-        if "docs.google.com" in link:
-            export_url = link.replace("/edit?usp=sharing", "/export?format=csv")
-            export_url = export_url.replace("/edit", "/export?format=csv")
-        else:
-            export_url = link
-        
-        df_raw = pd.read_csv(export_url, header=None)
-        
-        data_points = []
-        row1_vals = df_raw.iloc[1, :].astype(str).values
-        block_starts = [i for i, val in enumerate(row1_vals) if "Last stock" in val]
-
-        for start_col in block_starts:
-            date_val = df_raw.iloc[0, start_col]
-            if pd.isna(date_val): date_val = df_raw.iloc[0, start_col+1]
+        # Get link from secrets or use a default if testing
+        if "public_sheet_url" in st.secrets:
+            link = st.secrets["public_sheet_url"]
+            # Convert to CSV export for fast reading
+            if "docs.google.com" in link:
+                export_url = link.replace("/edit?usp=sharing", "/export?format=csv")
+                export_url = export_url.replace("/edit", "/export?format=csv")
+            else:
+                export_url = link
             
-            try:
-                current_date = pd.to_datetime(date_val, dayfirst=True)
-            except:
-                continue 
+            # PARSE THE BLOCKS
+            df_raw = pd.read_csv(export_url, header=None)
+            row1_vals = df_raw.iloc[1, :].astype(str).values
+            block_starts = [i for i, val in enumerate(row1_vals) if "Last stock" in val]
 
-            headers = df_raw.iloc[1, start_col:start_col+6].astype(str).values
-            try:
-                idx_stock = np.where([("Today Stock" in h) for h in headers])[0][0]
-                idx_sold  = np.where([("Sold" in h) for h in headers])[0][0]
-                idx_order = np.where([("order" in h and "ordered" not in h) for h in headers])[0][0]
-            except:
-                continue
-
-            items = df_raw.iloc[2:, 0].values 
-            
-            for i, item in enumerate(items):
-                if pd.isna(item): continue
-                row_idx = i + 2
-                
+            for start_col in block_starts:
+                # Get Date
+                date_val = df_raw.iloc[0, start_col]
+                if pd.isna(date_val): date_val = df_raw.iloc[0, start_col+1]
                 try:
-                    s_val = pd.to_numeric(df_raw.iloc[row_idx, start_col + idx_stock], errors='coerce')
-                    sold_val = pd.to_numeric(df_raw.iloc[row_idx, start_col + idx_sold], errors='coerce')
-                    o_val = pd.to_numeric(df_raw.iloc[row_idx, start_col + idx_order], errors='coerce')
-                    
-                    if pd.isna(s_val): s_val = 0
-                    if pd.isna(sold_val): sold_val = 0
-                    if pd.isna(o_val): continue 
-
-                    data_points.append({
-                        "Date": current_date,
-                        "Day_of_Week": current_date.day_name(),
-                        "Item": str(item).lower(),
-                        "Stock_Level": s_val,
-                        "Sold_Qty": sold_val,
-                        "Ordered_Qty": o_val
-                    })
+                    current_date = pd.to_datetime(date_val, dayfirst=True)
                 except:
                     continue
 
-        df_clean = pd.DataFrame(data_points)
-        
-        valid_map = {
-            '9cuts': '9cuts', 'halal 9-cut chicken 1.6kg': '9cuts',
-            'fillets': 'fillets', 'halal chicken fillets 120 - 140g': 'fillets',
-            'strips': 'strips', 'halal chicken strips': 'strips',
-            'wings': 'wings', 'halal prime prime wings': 'wings'
-        }
-        df_clean['Item_Clean'] = df_clean['Item'].map(valid_map).fillna(df_clean['Item'])
-        
-        return df_clean.sort_values("Date")
-        
+                # Find Columns
+                headers = df_raw.iloc[1, start_col:start_col+6].astype(str).values
+                try:
+                    # We map "Today Stock" -> Stock_Level, "order" -> Ordered_Qty
+                    idx_stock = np.where([("Today Stock" in h) for h in headers])[0][0]
+                    idx_order = np.where([("order" in h and "ordered" not in h) for h in headers])[0][0]
+                except:
+                    continue
+
+                items = df_raw.iloc[2:, 0].values 
+                for i, item in enumerate(items):
+                    if pd.isna(item): continue
+                    row_idx = i + 2
+                    try:
+                        s_val = pd.to_numeric(df_raw.iloc[row_idx, start_col + idx_stock], errors='coerce')
+                        o_val = pd.to_numeric(df_raw.iloc[row_idx, start_col + idx_order], errors='coerce')
+                        
+                        if pd.isna(s_val): s_val = 0
+                        if pd.isna(o_val): continue # Needs a target to train
+
+                        all_data.append({
+                            "Date": current_date,
+                            "Day_of_Week": current_date.day_name(),
+                            "Item": str(item).lower(),
+                            "Stock_Level": s_val,
+                            "Ordered_Qty": o_val,
+                            "Source": "History"
+                        })
+                    except:
+                        continue
     except Exception as e:
+        # If history fails, we just continue to New Data
+        print(f"History Load Error: {e}")
+
+    # --- PART B: LOAD NEW DB (The "Database_Log" Tab) ---
+    try:
+        client = get_google_sheet_client()
+        if client:
+            sheet = client.open_by_key(st.secrets["sheet_id"]).worksheet("Database_Log")
+            new_records = sheet.get_all_records()
+            
+            for row in new_records:
+                # Map the new DB columns to the Training Format
+                # DB Cols: Date, Day_of_Week, Time, Item, Current_Stock, AI_Rec, Actual_Order
+                try:
+                    all_data.append({
+                        "Date": pd.to_datetime(row['Date']),
+                        "Day_of_Week": row['Day_of_Week'],
+                        "Item": str(row['Item']).lower(),
+                        "Stock_Level": float(row['Current_Stock']),
+                        "Ordered_Qty": float(row['Actual_Order']), # We train on what was ACTUALLY ordered
+                        "Source": "New_Log"
+                    })
+                except:
+                    continue
+    except:
+        pass # If new DB is empty or fails, just use history
+
+    # --- COMBINE & CLEAN ---
+    if not all_data:
         return pd.DataFrame()
-
-df = load_and_parse_data(SHEET_LINK)
+    
+    df_final = pd.DataFrame(all_data)
+    
+    # Standardize Item Names
+    valid_map = {
+        '9cuts': '9cuts', 'halal 9-cut chicken 1.6kg': '9cuts',
+        'fillets': 'fillets', 'halal chicken fillets 120 - 140g': 'fillets',
+        'strips': 'strips', 'halal chicken strips': 'strips',
+        'wings': 'wings', 'halal prime prime wings': 'wings'
+    }
+    df_final['Item_Clean'] = df_final['Item'].map(valid_map).fillna(df_final['Item'])
+    
+    return df_final
 
 # ==========================================
-# 3. DASHBOARD
+# 3. AI ENGINE
 # ==========================================
-st.title("🍗 SFC Winterton Command Center")
-
-if df.empty:
-    st.warning("waiting for connection...")
-    st.stop()
-
-latest_date = df['Date'].max().strftime('%d %b %Y')
-st.caption(f"🟢 Connected Live | Last Data: {latest_date} | Records: {len(df)}")
-
-tab1, tab2 = st.tabs(["🔮 ORDER PREDICTOR", "📊 SALES TRENDS"])
-
-with tab1:
+def train_model(df):
+    if df.empty or len(df) < 5: return None
+    
+    # Train on: Day, Item, Stock --> Predict: Order Qty
     X = df[['Day_of_Week', 'Item_Clean', 'Stock_Level']]
     y = df['Ordered_Qty']
     
@@ -149,58 +166,132 @@ with tab1:
     ])
     
     model.fit(X, y)
-    
-    st.markdown("### 🛒 Enter Tonight's Stock")
-    
-    with st.form("order_calc"):
-        col_day, col_blank = st.columns([1, 2])
-        day = col_day.selectbox("Ordering For Which Night?", ["Monday", "Wednesday", "Friday"])
-        
-        c1, c2, c3, c4 = st.columns(4)
-        s_9cuts = c1.number_input("9-Cuts", value=1.0, step=0.5)
-        s_fillets = c2.number_input("Fillets", value=1.0, step=0.5)
-        s_strips = c3.number_input("Strips", value=1.0, step=0.5)
-        s_wings = c4.number_input("Wings", value=1.0, step=0.5)
-        
-        submitted = st.form_submit_button("CALCULATE ORDER", type="primary")
+    return model
 
-    if submitted:
-        st.markdown("---")
-        st.markdown(f"#### ✅ Recommended Order for {day} Night:")
+# ==========================================
+# 4. APP INTERFACE
+# ==========================================
+def main():
+    # HEADER
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        # Professional Logo
+        st.image("https://southernfriedchicken.com/wp-content/uploads/2018/04/SouthernFriedChicken-White.png", width=100)
+    with col2:
+        st.markdown('<div class="main-header">SFC WINTERTON INVENTORY</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sub-header">Manager Control Terminal</div>', unsafe_allow_html=True)
+
+    # LOAD DATA & TRAIN
+    df_combined = load_all_data()
+    model = train_model(df_combined)
+    
+    # Status Bar
+    if model:
+        rec_count = len(df_combined)
+        last_date = df_combined['Date'].max().strftime('%d %b')
+        st.success(f"✅ AI Online | Trained on {rec_count} records (History + New) | Latest Data: {last_date}")
+    else:
+        st.warning("⚠️ AI Initializing... (Please ensure 'public_sheet_url' is correct in Secrets)")
+
+    st.markdown("---")
+
+    # CONTROLS
+    with st.expander("📅 Settings (Date/Time)", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        now = datetime.now()
+        selected_date = c1.date_input("Ordering Date", now)
+        selected_time = c2.time_input("Time", now)
+        day_name = selected_date.strftime("%A")
+        c3.text_input("Day", value=day_name, disabled=True)
+
+    # SESSION STATE INIT
+    if 'inventory' not in st.session_state:
+        st.session_state.inventory = {
+            '9cuts': {'stock': 0.0, 'rec': 0, 'actual': 0},
+            'fillets': {'stock': 0.0, 'rec': 0, 'actual': 0},
+            'strips': {'stock': 0.0, 'rec': 0, 'actual': 0},
+            'wings': {'stock': 0.0, 'rec': 0, 'actual': 0}
+        }
+
+    # --- THE INPUT GRID ---
+    st.markdown("### 📋 Enter Stock & Confirm Order")
+    
+    # Header Row
+    cols = st.columns([2, 2, 2, 2])
+    cols[0].markdown("**ITEM**")
+    cols[1].markdown("**STOCK (Fridge)**")
+    cols[2].markdown("**AI SUGGESTION**")
+    cols[3].markdown("**FINAL ORDER**")
+    
+    items_list = ["9cuts", "fillets", "strips", "wings"]
+    
+    for item in items_list:
+        c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
         
-        items = [("9cuts", s_9cuts), ("fillets", s_fillets), ("strips", s_strips), ("wings", s_wings)]
-        res_cols = st.columns(4)
+        # 1. Name
+        c1.markdown(f"##### {item.upper()}")
         
-        for i, (name, stock) in enumerate(items):
-            input_data = pd.DataFrame({'Day_of_Week': [day], 'Item_Clean': [name], 'Stock_Level': [stock]})
-            pred = model.predict(input_data)[0]
-            qty = max(0, int(round(pred)))
+        # 2. Stock Input
+        val = c2.number_input(f"s_{item}", min_value=0.0, step=0.5, key=f"stock_{item}", label_visibility="collapsed")
+        
+        # 3. AI Prediction
+        prediction = 0
+        if model:
+            # Create a 1-row dataframe for prediction
+            input_data = pd.DataFrame({
+                'Day_of_Week': [day_name], 
+                'Item_Clean': [item], 
+                'Stock_Level': [val]
+            })
+            try:
+                pred_raw = model.predict(input_data)[0]
+                prediction = int(round(max(0, pred_raw)))
+            except:
+                prediction = 0
+        
+        c3.info(f"{prediction} Boxes")
+        
+        # 4. Actual Order Input (Default = Prediction)
+        # We set value=prediction only if user hasn't typed yet, or we can just leave it 0
+        # Better UX: User sees AI suggestion, then types final decision.
+        actual = c4.number_input(f"o_{item}", min_value=0, value=prediction, step=1, key=f"order_{item}", label_visibility="collapsed")
+        
+        # Save to state
+        st.session_state.inventory[item] = {'stock': val, 'rec': prediction, 'actual': actual}
+
+    st.markdown("---")
+
+    # SUBMIT BUTTON
+    if st.button("💾 SAVE TO DATABASE"):
+        client = get_google_sheet_client()
+        if not client:
+            st.error("❌ Database Connection Failed. Check Secrets.")
+            st.stop()
             
-            with res_cols[i]:
-                st.metric(label=name.upper(), value=f"{qty} Cases", delta=f"Stock: {stock}")
+        try:
+            sheet = client.open_by_key(st.secrets["sheet_id"]).worksheet("Database_Log")
+            
+            rows = []
+            for item in items_list:
+                data = st.session_state.inventory[item]
+                # [Date, Day, Time, Item, Current_Stock, AI_Rec, Actual_Order]
+                rows.append([
+                    selected_date.strftime("%Y-%m-%d"),
+                    day_name,
+                    selected_time.strftime("%H:%M:%S"),
+                    item,
+                    data['stock'],
+                    data['rec'],
+                    data['actual']
+                ])
+            
+            sheet.append_rows(rows)
+            st.balloons()
+            st.success("✅ Order Saved! The AI has learned from this decision.")
+            
+        except Exception as e:
+            st.error(f"Save Error: {e}")
+            st.info("Ensure you created a tab named 'Database_Log' in your Google Sheet.")
 
-with tab2:
-    st.markdown("### 📈 Chicken Usage Trends")
-    
-    avg_sold = df.groupby(['Day_of_Week', 'Item_Clean'])['Sold_Qty'].mean().reset_index()
-    
-    chart_bar = alt.Chart(avg_sold).mark_bar().encode(
-        x=alt.X('Day_of_Week', sort=['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']),
-        y='Sold_Qty',
-        color='Item_Clean',
-        tooltip=['Day_of_Week', 'Item_Clean', 'Sold_Qty']
-    ).properties(title="Average Cases Sold per Day").interactive()
-    
-    st.altair_chart(chart_bar, use_container_width=True)
-    
-    total_vol = df.groupby('Item_Clean')['Sold_Qty'].sum().reset_index()
-    chart_pie = alt.Chart(total_vol).mark_arc(innerRadius=50).encode(
-        theta=alt.Theta(field="Sold_Qty", type="quantitative"),
-        color=alt.Color(field="Item_Clean", type="nominal"),
-        tooltip=['Item_Clean', 'Sold_Qty']
-    ).properties(title="Total Consumption Share")
-    
-    st.altair_chart(chart_pie, use_container_width=True)
-
-st.markdown("---")
-st.caption("System linked to SFC Live Google Sheet. Updates automatically.")
+if __name__ == "__main__":
+    main()
