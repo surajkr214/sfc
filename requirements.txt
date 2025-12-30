@@ -1,6 +1,10 @@
-gspread
-oauth2client
 streamlit
 pandas
 numpy
 scikit-learn
+gspread
+oauth2client
+holidays
+plotly
+kaleido
+requests
