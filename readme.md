@@ -95,7 +95,7 @@ To run this application on your own machine for development:
 
 1. **Clone the repo:**
 ```bash
-git clone [https://github.com/YOUR_USERNAME/SFC-Winterton.git](https://github.com/YOUR_USERNAME/SFC-Winterton.git)
+git clone [https://github.com/surajkr214/sfc.git](https://github.com/surajkr214/sfc.git)
 
 ```
 
