@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components 
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -6,6 +7,8 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import holidays
 import requests
+import urllib.parse
+import time
 
 # --- 0. CONFIGURATION ---
 st.set_page_config(page_title="SFC Operations", page_icon="🍗", layout="wide")
@@ -27,10 +30,7 @@ PAY_WEEK_BOOST = 1.15     # 15% Boost
 
 WEATHER_MULTIPLIERS = {
     "Normal": 1.0,
-    "Sunny": 1.15,        # +15% (Foot traffic)
-    "Rainy": 1.05,        # +5% (Delivery)
-    "Snow": 0.80,         # -20% (Shop closed/Empty)
-    "Cloudy": 1.0
+    "Sunny": 1.15, "Rainy": 1.05, "Snow": 0.80, "Cloudy": 1.0
 }
 
 EVENT_MULTIPLIERS = {
@@ -51,19 +51,13 @@ PIECES_PER_BOX = {'9cuts': 90, 'fillets': 40, 'strips': 60, 'wings': 80}
 st.markdown("""
     <style>
     .main-header { font-size: 2rem; font-weight: bold; color: #b30000; }
-    .ai-rec-box {
-        background-color: #e3f2fd; border: 1px solid #90caf9; color: #1565c0;
-        padding: 10px; border-radius: 8px; text-align: center; font-weight: 800; font-size: 24px;
-    }
+    .ai-rec-box { background-color: #e3f2fd; border: 1px solid #90caf9; color: #1565c0; padding: 10px; border-radius: 8px; text-align: center; font-weight: 800; font-size: 24px; }
     .math-explainer { font-size: 11px; color: #666; font-style: italic; margin-top: 4px; line-height: 1.4; background: #111; padding: 5px; border-radius: 4px; }
-    
     .badge-trend-up { background-color: #e8f5e9; color: #2e7d32; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; border: 1px solid #c8e6c9; }
     .badge-trend-down { background-color: #ffebee; color: #c62828; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; border: 1px solid #ffcdd2; }
-    
     .status-safe { color: #2e7d32; font-weight: bold; font-size: 12px; }
     .status-danger { color: #c62828; font-weight: bold; font-size: 12px; }
     .status-warn { color: #f9a825; font-weight: bold; font-size: 12px; }
-
     .stNumberInput input { font-weight: bold; text-align: center; font-size: 16px; }
     div[data-testid="stRadio"] > label { display: none; }
     div[data-testid="stRadio"] > div { background-color: #161616; padding: 6px; border-radius: 12px; display: flex; justify-content: center; gap: 10px; }
@@ -73,7 +67,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. AUTONOMOUS AGENTS
+# 1. AUTONOMOUS AGENTS & HELPERS
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_live_weather():
@@ -83,18 +77,56 @@ def fetch_live_weather():
         if response.status_code == 200:
             condition = response.text.strip().lower()
             if "sun" in condition or "clear" in condition: return "Sunny"
-            if "rain" in condition or "drizzle" in condition or "shower" in condition: return "Rainy"
+            if "rain" in condition or "drizzle" in condition: return "Rainy"
             if "snow" in condition: return "Snow"
-            if "cloud" in condition or "overcast" in condition: return "Cloudy"
+            if "cloud" in condition: return "Cloudy"
     except: pass
     return "Normal"
 
 def check_pay_week_status(check_date):
-    """Checks if date is near last Friday of month"""
     next_month = check_date.replace(day=28) + timedelta(days=4)
     last_day_of_month = next_month - timedelta(days=next_month.day)
     days_left = (last_day_of_month - check_date).days
     return days_left <= 7 and days_left >= 0
+
+def get_delivery_message_header():
+    now = datetime.now()
+    current_day_name = now.strftime("%A").upper()
+    current_hour = now.hour
+    delivery_days = ["TUESDAY", "THURSDAY", "SATURDAY"]
+    if current_day_name in delivery_days and current_hour < 11:
+        return f"today ({current_day_name})"
+    else:
+        if current_day_name == "MONDAY": return "tomorrow (TUESDAY)"
+        elif current_day_name == "WEDNESDAY": return "tomorrow (THURSDAY)"
+        elif current_day_name == "FRIDAY": return "tomorrow (SATURDAY)"
+        else: return "next delivery"
+
+def generate_whatsapp_link(orders):
+    day_str = get_delivery_message_header()
+    items_text = ""
+    for item, qty in orders.items():
+        if qty > 0:
+            items_text += f"{item.title()}: {qty} boxes\n"
+
+    message = f"""Hi Jav,
+Good morning!
+
+This is Suraj from SFC Salisbury.
+
+We would like to place the following order for delivery {day_str},
+
+{items_text}
+
+Please provide (BIGGER) Strips & wings as we got lots of complaints from customers.
+
+Thanks for your continued support!
+
+Best regards,
+Suraj 
+SFC Salisbury"""
+    encoded_message = urllib.parse.quote(message)
+    return f"https://wa.me/?text={encoded_message}"
 
 # ==========================================
 # 2. CORE FUNCTIONS
@@ -130,17 +162,11 @@ def smart_append(sheet_name, data_dict):
     try:
         sheet = client.open_by_key(st.secrets["sheet_id"]).worksheet(sheet_name)
         headers = sheet.row_values(1)
-        # Create map of Column Name -> Index
         col_map = {name.strip(): i for i, name in enumerate(headers)}
-        
-        # Prepare row with empty strings
         row_to_write = [''] * len(headers)
-        
-        # Fill in data where keys match headers
         for key, value in data_dict.items():
             if key in col_map:
                 row_to_write[col_map[key]] = value
-                
         sheet.append_row(row_to_write)
         return True, "Success"
     except Exception as e: return False, str(e)
@@ -151,7 +177,6 @@ def smart_append(sheet_name, data_dict):
 @st.cache_data(ttl=60, show_spinner=False)
 def calculate_inventory_stats():
     all_usage = []
-
     # A. Legacy Data
     if "public_sheet_url" in st.secrets:
         try:
@@ -179,7 +204,6 @@ def calculate_inventory_stats():
                         all_usage.append({ "Item": str(item).lower(), "Day_of_Week": day_name, "Daily_Burn": qty / est_cover, "Date": dt })
                     except: continue
         except: pass
-
     # B. Live Data
     try:
         client = get_client()
@@ -194,21 +218,16 @@ def calculate_inventory_stats():
                         all_usage.append({ "Item": str(row['Items']).lower(), "Day_of_Week": row['Day_of_Week'], "Daily_Burn": qty / max(1, cov), "Date": dt })
                 except: continue
     except: pass
-
     if not all_usage: return pd.DataFrame(), pd.DataFrame()
-    
     df = pd.DataFrame(all_usage)
     valid_map = {'9cuts':'9cuts', 'fillets':'fillets', 'strips':'strips', 'wings':'wings'}
     df['Item_Clean'] = df['Item'].map(valid_map).fillna(df['Item'])
-    
     volatility_stats = df.groupby(['Item_Clean', 'Day_of_Week'])['Daily_Burn'].agg(['mean', 'std', 'count']).reset_index()
-    
     recent_cutoff = datetime.now() - timedelta(days=14)
     df_recent = df[df['Date'] >= recent_cutoff]
     trend_avg = df_recent.groupby(['Item_Clean'])['Daily_Burn'].mean().reset_index().rename(columns={'Daily_Burn': 'Recent_Avg'})
     long_avg = df.groupby(['Item_Clean'])['Daily_Burn'].mean().reset_index().rename(columns={'Daily_Burn': 'Long_Avg'})
     trend_df = pd.merge(long_avg, trend_avg, on='Item_Clean', how='left')
-    
     return volatility_stats, trend_df
 
 def analyze_stock_logic(vol_stats, trend_stats, item, day, current_stock, days_cover, event, weather, is_pay_week):
@@ -216,54 +235,39 @@ def analyze_stock_logic(vol_stats, trend_stats, item, day, current_stock, days_c
     recent_burn = 0.5
     volatility = 0.2
     trend_status = "Stable"
-    
     if not trend_stats.empty:
         t_row = trend_stats[trend_stats['Item_Clean'] == item]
         if not t_row.empty:
             long_term_burn = t_row['Long_Avg'].values[0]
             if not np.isnan(t_row['Recent_Avg'].values[0]):
                 recent_burn = t_row['Recent_Avg'].values[0]
-
     if recent_burn > (long_term_burn * 1.15): trend_status = "Trending Up"
     elif recent_burn < (long_term_burn * 0.85): trend_status = "Trending Down"
-
     if not vol_stats.empty:
         v_row = vol_stats[(vol_stats['Item_Clean'] == item) & (vol_stats['Day_of_Week'] == day)]
         if not v_row.empty:
             volatility = v_row['std'].values[0] if v_row['count'].values[0] > 2 else long_term_burn * 0.3
-        else:
-            volatility = long_term_burn * 0.3
-
+        else: volatility = long_term_burn * 0.3
     evt_mult = EVENT_MULTIPLIERS.get(event, 1.0)
-    if event not in EVENT_MULTIPLIERS:
-        if "Season" in event or "Holiday" in event: evt_mult = 1.25
-        
+    if event not in EVENT_MULTIPLIERS and ("Season" in event or "Holiday" in event): evt_mult = 1.25
     pay_mult = PAY_WEEK_BOOST if is_pay_week else 1.0
     wthr_mult = WEATHER_MULTIPLIERS.get(weather, 1.0)
-    
     mgr_cycle = recent_burn * days_cover * evt_mult * pay_mult * wthr_mult
     mgr_buffer = mgr_cycle * MANAGER_BUFFER
     mgr_total = mgr_cycle + mgr_buffer
-
     sci_cycle = long_term_burn * days_cover * evt_mult
     sci_buffer = max(SERVICE_LEVEL_Z * volatility * np.sqrt(days_cover), long_term_burn * MIN_SAFETY_FLOOR)
     sci_total = sci_cycle + sci_buffer
-
     blended_need = (mgr_total * WEIGHT_MANAGER) + (sci_total * WEIGHT_SCIENCE)
     suggestion = max(0, blended_need - current_stock)
     final_rec = int(np.ceil(suggestion))
-
-    explainer = f"Trend: {mgr_total:.1f}<br>"
-    explainer += f"Stats: {sci_total:.1f}<br>"
-    
+    explainer = f"Trend: {mgr_total:.1f}<br>Stats: {sci_total:.1f}<br>"
     factors = []
     if is_pay_week: factors.append("💰 PayWeek")
     if wthr_mult != 1.0: factors.append(f"Weather ({weather})")
     if evt_mult != 1.0: factors.append(f"Event")
-    
     if factors: explainer += f"Fact: {', '.join(factors)}<br>"
     explainer += f"Need {blended_need:.1f} - Stock {current_stock}"
-
     status_msg = "Safe"
     status_css = "status-safe"
     if current_stock < (blended_need * 0.5):
@@ -272,7 +276,6 @@ def analyze_stock_logic(vol_stats, trend_stats, item, day, current_stock, days_c
     elif current_stock < blended_need:
         status_msg = "⚠️ Low"
         status_css = "status-warn"
-
     return final_rec, explainer, status_msg, status_css, trend_status
 
 # ==========================================
@@ -282,7 +285,6 @@ def get_smart_defaults(date_obj):
     is_stock_night = date_obj.weekday() in [0, 2, 4] and datetime.now().hour >= 21
     view_idx = 0 if is_stock_night else 1
     cov = 3 if date_obj.weekday() == 4 else 2 if date_obj.weekday() in [0, 2] else 1
-    
     year = date_obj.year
     uk_hol = holidays.UK(years=[year, year+1])
     event = "Normal Day"
@@ -291,7 +293,6 @@ def get_smart_defaults(date_obj):
     elif (date_obj.month == 12 and date_obj.day >= 20) or (date_obj.month == 1 and date_obj.day <= 2):
         event = "Season: Christmas/New Year"
     elif 7 <= date_obj.month <= 8: event = "Season: Summer Holidays"
-        
     return view_idx, cov, event
 
 def get_wastage_default():
@@ -304,87 +305,66 @@ def main():
     col1, col2 = st.columns([1, 5])
     with col1: st.image("https://southernfriedchicken.com/wp-content/uploads/2018/04/SouthernFriedChicken-White.png", width=80)
     with col2: st.markdown('<div class="main-header">SFC OPERATIONS</div>', unsafe_allow_html=True)
-
     ITEMS_LIST, REASONS_LIST = load_config()
-    
     with st.spinner("🚀 Booting AI & Fetching Weather..."):
         vol_stats, trend_stats = calculate_inventory_stats()
         live_weather = fetch_live_weather()
-
     if 'view_init' not in st.session_state:
         def_idx, _, _ = get_smart_defaults(datetime.now())
         st.session_state.view_default = def_idx
         st.session_state.view_init = True
-
     mode = st.radio("Navigation", ["📦 Stock & Order", "🗑️ Wastage Entry", "🤖 Manager Assistant"], 
                     index=st.session_state.view_default, horizontal=True)
     st.write("")
 
-    # --- VIEW: STOCK & ORDER ---
     if mode == "📦 Stock & Order":
         with st.container(border=True):
             c1, c2, c3, c4 = st.columns(4)
             ord_date = c1.date_input("Date", datetime.now())
             _, def_cov, def_evt = get_smart_defaults(ord_date)
             auto_pay_week = check_pay_week_status(pd.to_datetime(ord_date))
-            
             c2.text_input("Day", ord_date.strftime("%A"), disabled=True)
             days_cover = c3.number_input("Days to Cover", 1, 7, def_cov)
-            
             c4.markdown("**Manager Context**")
             col_evt, col_wthr = c4.columns(2)
-            
             opts = list(EVENT_MULTIPLIERS.keys())
             if def_evt not in opts and "Normal" not in def_evt: opts.insert(0, def_evt)
             evt_idx = opts.index(def_evt) if def_evt in opts else opts.index("Normal Day")
             event = col_evt.selectbox("Event", opts, index=evt_idx, label_visibility="collapsed")
-            
             w_opts = list(WEATHER_MULTIPLIERS.keys())
             w_idx = w_opts.index(live_weather) if live_weather in w_opts else 0
             weather = col_wthr.selectbox("Weather", w_opts, index=w_idx, label_visibility="collapsed")
-            
             is_pay_week = c4.checkbox("💰 Pay Week?", value=auto_pay_week)
-
         st.markdown("---")
         h1, h2, h3, h4 = st.columns([2, 2, 2, 2])
         h1.markdown("**ITEM**"); h2.markdown("**STOCK CHECK**"); h3.markdown("**HYBRID ORDER**"); h4.markdown("**FINAL DECISION**")
-
         if 'orders' not in st.session_state: st.session_state.orders = {}
-
         for item in ITEMS_LIST:
             with st.container():
                 c1, c2, c3, c4 = st.columns([2, 2, 2, 2], vertical_alignment="top")
-                
                 rec, explanation, buff_stat, buff_color, trend = analyze_stock_logic(
                     vol_stats, trend_stats, item, ord_date.strftime("%A"), 0, days_cover, event, weather, is_pay_week
                 )
-                
                 badge_html = ""
                 if trend == "Trending Up": badge_html = "<span class='badge-trend-up'>📈 Busy Trend</span>"
                 elif trend == "Trending Down": badge_html = "<span class='badge-trend-down'>📉 Quiet Trend</span>"
-                
                 c1.markdown(f"#### {item.upper()} {badge_html}", unsafe_allow_html=True)
-                
                 curr_stock = c2.number_input(f"s_{item}", 0.0, step=0.5, key=f"s_{item}", label_visibility="collapsed")
-                
                 rec, explanation, buff_stat, buff_color, _ = analyze_stock_logic(
                     vol_stats, trend_stats, item, ord_date.strftime("%A"), curr_stock, days_cover, event, weather, is_pay_week
                 )
-                
                 c2.markdown(f"<div class='{buff_color}'>{buff_stat}</div>", unsafe_allow_html=True)
                 c3.markdown(f"<div class='ai-rec-box'>{rec}</div>", unsafe_allow_html=True)
                 c3.markdown(f"<div class='math-explainer'>{explanation}</div>", unsafe_allow_html=True)
-
                 final_order = c4.number_input(f"o_{item}", 0, step=1, key=f"o_{item}", label_visibility="collapsed")
-                
                 reason = ""
                 if final_order != rec and final_order != 0:
                     reason = c4.text_input(f"Reason", placeholder="Why change?", key=f"r_{item}", label_visibility="collapsed")
-                
                 st.session_state.orders[item] = {"Stock": curr_stock, "Rec": rec, "Order": final_order, "Reason": reason, "Buff": buff_stat}
-
         st.markdown("---")
-        if st.button("CONFIRM ORDER", type="primary", use_container_width=True):
+        
+        # --- ONE CLICK SAVE & REDIRECT ---
+        if st.button("CONFIRM ORDER & SEND TO WHATSAPP", type="primary", use_container_width=True):
             success = 0
             for item in ITEMS_LIST:
                 d = st.session_state.orders[item]
@@ -404,12 +384,18 @@ def main():
                 }
                 ok, _ = smart_append("Database_Log", data)
                 if ok: success += 1
-            if success: 
-                st.success(f"✅ Saved {success} items. Hybrid Engine Updated.")
+            if success:
+                st.success(f"✅ Saved. Redirecting to WhatsApp...")
                 st.cache_data.clear()
-            else: st.error("Save Failed.")
+                wa_orders = {itm: st.session_state.orders[itm]['Order'] for itm in ITEMS_LIST if st.session_state.orders[itm]['Order'] > 0}
+                wa_link = generate_whatsapp_link(wa_orders)
+                # STRONGER REDIRECT: META REFRESH
+                st.markdown(f'<meta http-equiv="refresh" content="0;url={wa_link}">', unsafe_allow_html=True)
+                # FALLBACK LINK
+                st.markdown(f"If WhatsApp doesn't open, [Click Here]({wa_link})")
+            else:
+                st.error("Save Failed.")
 
-    # --- VIEW: WASTAGE ---
     elif mode == "🗑️ Wastage Entry":
         st.markdown("### Daily Wastage Log")
         c1, c2, c3 = st.columns(3)
@@ -419,7 +405,6 @@ def main():
         r_opts = REASONS_LIST.copy()
         if def_r in r_opts: r_opts.insert(0, r_opts.pop(r_opts.index(def_r)))
         reason = c3.selectbox("Reason", r_opts)
-
         st.markdown("---")
         w_data = {}
         with st.form("waste"):
