@@ -389,8 +389,16 @@ def main():
                 st.cache_data.clear()
                 wa_orders = {itm: st.session_state.orders[itm]['Order'] for itm in ITEMS_LIST if st.session_state.orders[itm]['Order'] > 0}
                 wa_link = generate_whatsapp_link(wa_orders)
-                # STRONGER REDIRECT: META REFRESH
-                st.markdown(f'<meta http-equiv="refresh" content="0;url={wa_link}">', unsafe_allow_html=True)
+                
+                # --- MOBILE-COMPATIBLE REDIRECT ---
+                # We use window.parent.location.href to break out of the Streamlit iframe
+                js = f"""
+                <script>
+                    window.parent.location.href = '{wa_link}';
+                </script>
+                """
+                components.html(js, height=0)
+                
                 # FALLBACK LINK
                 st.markdown(f"If WhatsApp doesn't open, [Click Here]({wa_link})")
             else:
