@@ -110,20 +110,17 @@ def generate_whatsapp_link(orders):
             items_text += f"{item.title()}: {qty} boxes\n"
 
     message = f"""Hi Jav,
-Good morning!
 
-This is Suraj from SFC Salisbury.
 
 We would like to place the following order for delivery {day_str},
 
 {items_text}
 
-Please provide (BIGGER) Strips & wings as we got lots of complaints from customers.
+Please provide (BIGGER) Strips Fillets & wings as we got lots of complaints from customers.
 
 Thanks for your continued support!
 
 Best regards,
-Suraj 
 SFC Salisbury"""
     encoded_message = urllib.parse.quote(message)
     return f"https://wa.me/?text={encoded_message}"
